@@ -39,7 +39,10 @@ def bring_to_front():
     hwnd = get_weixin_hwnd()
     if hwnd:
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(hwnd)
+        try:
+            win32gui.SetForegroundWindow(hwnd)  # 后台进程可能无权抢前台，会抛异常
+        except Exception:
+            pass
     time.sleep(0.4)
 
 
@@ -145,6 +148,7 @@ class ChatSession:
         self.send_x = None         # 发送按钮缓存坐标（客户区相对坐标）
         self.send_y = None
         self.session_pos = {}      # 会话列表项坐标缓存 {名字: (cx, cy)}，恢复状态时刷新
+        self.last_list = []        # 最近一次列出的会话名列表，用于 /序号 选择
 
     def _get_seen(self, friend):
         if friend not in self.seen_map:
@@ -222,6 +226,11 @@ class ChatSession:
                     if self._current_chat_name(main_window) == friend:
                         opened = True
                         break
+            # 窗口此刻恢复且聊天已打开，顺带把发送按钮坐标也缓存好（全局一致）
+            try:
+                self._cache_send_btn_pos(main_window)
+            except Exception:
+                pass
             minimize()
         if not opened:
             raise RuntimeError(f'无法打开「{friend}」的会话')
@@ -235,15 +244,7 @@ class ChatSession:
     def _send_text(self, main_window, text):
         """后台发送：set_text 写入 + PostMessage 点击发送按钮，全程最小化"""
         if self.send_x is None:
-            # 发送按钮坐标尚未缓存（启动时微信是最小化的），补缓存一次
-            bring_to_front()
-            try:
-                self._cache_send_btn_pos(main_window)
-            except Exception:
-                pass
-            minimize()
-        if self.send_x is None:
-            raise RuntimeError('未能定位发送按钮')
+            raise RuntimeError('发送按钮坐标未就绪')
         edit_area = main_window.child_window(**Edits.CurrentChatEdit)
         if not edit_area.exists(timeout=2):
             raise RuntimeError('未找到输入框')
@@ -269,6 +270,17 @@ class ChatSession:
             return prefix[0]
         return None
 
+    def _resolve_target(self, text, main_window):
+        """把用户输入解析成好友名：支持 /序号（取自最近列出的列表）和 /名字。
+        返回 (好友名, 错误信息)；好友名为 None 表示无效。"""
+        if text.isdigit():
+            idx = int(text)
+            if 1 <= idx <= len(self.last_list):
+                return self.last_list[idx - 1], None
+            return None, f'序号 {text} 超出范围（当前列表 {len(self.last_list)} 条），先 /list 查看'
+        # 名字：前缀匹配拿不到就用原始名字，交给 _open_friend 去滚动搜索
+        return (self._match_friend(text, main_window) or text), None
+
     def _show_list(self, main_window, deep=False, limit=20):
         """列最近会话。
         deep=False：用最小化下的可见读取（约 9 条，不弹 UI）——启动时用。
@@ -280,6 +292,10 @@ class ChatSession:
             except Exception:
                 raw = []
             self._refresh_session_pos(main_window)  # 滚动后坐标变了，刷新缓存
+            try:
+                self._cache_send_btn_pos(main_window)  # 顺带缓存发送按钮坐标
+            except Exception:
+                pass
             minimize()
             entries = [(n, f'({t})', str(m).replace('\n', ' ')[:25]) for n, t, m in raw]
         else:
@@ -289,7 +305,8 @@ class ChatSession:
         if not entries:
             print('未读取到会话列表')
             return
-        print(f'\n最近 {len(entries)} 个会话（/名字 切换）：')
+        self.last_list = [name for name, _, _ in entries]  # 供 /序号 选择
+        print(f'\n最近 {len(entries)} 个会话（/名字 或 /序号 切换）：')
         for i, (name, a, b) in enumerate(entries, 1):
             mark = ' *' if name == self.current else ''
             extra = '  '.join(x for x in (a, b) if x)
@@ -302,19 +319,12 @@ class ChatSession:
         except RuntimeError as e:
             print(f'[错误] {e}')
             return
-        # 若微信当前可见，直接在恢复状态预缓存坐标（无需任何前台操作，不弹 UI）；
-        # 若已最小化，则稍后首次切换/发送时再补缓存
-        if not win32gui.IsIconic(get_weixin_hwnd()):
-            self._refresh_session_pos(main_window)
-            try:
-                self._cache_send_btn_pos(main_window)
-            except Exception:
-                pass
-        # 列最近会话（最小化状态也能读，不弹 UI）
-        self._show_list(main_window)
+        # 列最近 15 个会话（dump_sessions 会短暂恢复窗口滚动读取，同时把会话坐标
+        # 和发送按钮坐标一并缓存好，之后的选择/切换/发送全程无感）
+        self._show_list(main_window, deep=True, limit=15)
         # 初始选择：输入 /名字 或直接回车选择第一个
         while self.current is None:
-            raw = input('\n输入 /名字 选择对话（或 /list 查看、/quit 退出）：').strip()
+            raw = input('\n输入 /名字 或 /序号 选择对话（/list 查看、/quit 退出）：').strip()
             if raw.lower() in ('/quit', '/exit', '/q'):
                 print('已退出。')
                 return
@@ -325,28 +335,20 @@ class ChatSession:
                 friend = raw[1:].strip()
                 if not friend:
                     continue
-                # 前缀匹配拿不到就用原始名字，交给 _open_friend 滚动搜索
-                target = self._match_friend(friend, main_window) or friend
+                target, err = self._resolve_target(friend, main_window)
+                if target is None:
+                    print(err)
+                    continue
                 try:
                     self._open_friend(main_window, target)
                 except Exception:
                     print(f'未找到「{friend}」，可用 /list 查看')
                 continue
 
-        # 若启动时未缓存到发送按钮（当时无聊天打开），进入首个聊天后补缓存（短暂恢复）
-        if self.send_x is None:
-            bring_to_front()
-            try:
-                self._cache_send_btn_pos(main_window)
-                self._refresh_session_pos(main_window)
-            except Exception:
-                pass
-            minimize()
-
         receiver = threading.Thread(target=self._receiver_loop, args=(main_window,), daemon=True)
         receiver.start()
         print(f'\n已进入与「{self.current}」的对话，输入消息回车发送')
-        print('命令：/list 列会话 · /名字 切换 · /quit 退出\n')
+        print('命令：/list 列会话 · /名字 或 /序号 切换 · /quit 退出\n')
 
         try:
             while not self.stop.is_set():
@@ -366,7 +368,10 @@ class ChatSession:
                     if not friend:
                         continue
                     with self.lock:
-                        target = self._match_friend(friend, main_window) or friend
+                        target, err = self._resolve_target(friend, main_window)
+                        if target is None:
+                            print(err)
+                            continue
                         try:
                             self._open_friend(main_window, target)
                             print(f'已切换到「{target}」')
